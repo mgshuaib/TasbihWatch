@@ -1,0 +1,55 @@
+# ════════════════════════════════════════════════════════
+#  ملف التشغيل المصغّر — انسخ كل هذا الملف والصقه في GitHub
+#  (يكفي لأول تجربة: يبني تطبيق الساعة على سيرفر أبل المجاني)
+# ════════════════════════════════════════════════════════
+name: تجربة بناء التطبيق
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 40
+    steps:
+      - name: جلب الملفات
+        uses: actions/checkout@v4
+
+      - name: تجهيز أدوات البناء
+        run: |
+          brew install xcodegen
+          xcodegen generate
+
+      - name: 🛠️ بناء التطبيق
+        run: |
+          set -o pipefail
+          xcodebuild build \
+            -project Tasbih.xcodeproj \
+            -scheme Tasbih \
+            -destination "generic/platform=watchOS" \
+            CODE_SIGNING_ALLOWED=NO 2>&1 | tee log.txt | tail -40
+
+      - name: 📋 النتيجة
+        if: always()
+        run: |
+          if grep -q "BUILD SUCCEEDED" log.txt; then
+            {
+              echo "## ✅ نجح بناء التطبيق"
+              echo ""
+              echo "**معناها:** الشيفرة سليمة. لا تفعل شيئًا."
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            ERRORS="$(grep -E 'error:' log.txt | sort -u | head -30 || true)"
+            echo "❌ الأخطاء:"
+            echo "$ERRORS"
+            {
+              echo "## ❌ فشل البناء"
+              echo ""
+              echo "### 🟥 الأخطاء — انسخها أو صوّر الشاشة وأرسلها:"
+              echo ""
+              echo '```'
+              echo "$ERRORS"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
