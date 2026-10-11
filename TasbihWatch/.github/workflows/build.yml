@@ -1,0 +1,156 @@
+name: Build سبحة → TestFlight
+
+# يعمل عند كل دفعة إلى الفرع main، أو يدويًا من زر Run workflow
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+concurrency:
+  group: tasbih-build
+  cancel-in-progress: true
+
+jobs:
+  build:
+    # سيرفر macOS مجاني على المستودعات العامة
+    runs-on: macos-15
+    timeout-minutes: 45
+
+    env:
+      SCHEME: Tasbih
+      PROJECT: Tasbih.xcodeproj
+      # ⚠️ كان مفقودًا تمامًا فكان البناء يفشل عند أول تشغيل:
+      #    `-destination "$BUILD_DESTINATION"` بقيمة فارغة = خطأ في xcodebuild
+      BUILD_DESTINATION: generic/platform=watchOS
+      # 🛣️ المسار A (تطبيق مستقل / تثبيت مباشر) = watchos-development-signed
+      # 🛣️ المسار B (مع حاوية iOS / TestFlight)   = app-store-connect
+      EXPORT_METHOD: watchos-development-signed
+      TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+      ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+
+    steps:
+      - name: جلب الشيفرة
+        uses: actions/checkout@v4
+
+      - name: اختيار أحدث Xcode المتوفّر على السيرفر
+        run: |
+          sudo xcode-select -s "$(ls -d /Applications/Xcode*.app | sort -V | tail -1)"
+          xcodebuild -version
+
+      - name: تثبيت XcodeGen
+        run: brew install xcodegen
+
+      - name: توليد مشروع Xcode من project.yml
+        run: xcodegen generate
+
+      # ───────── التوقيع ─────────
+
+      - name: كتابة مفتاح App Store Connect API
+        run: |
+          mkdir -p private_keys
+          echo "${{ secrets.ASC_KEY_CONTENT }}" | base64 --decode > "private_keys/AuthKey_${ASC_KEY_ID}.p8"
+
+      # ─── الشهادة: لا تحتاج شيئًا من جهازك ───
+      # أبل تسمح لسيرفر البناء بأن يُنشئ الشهادة والملفات التعريفية بنفسه
+      # ("التوقيع السحابي") بمجرد وجود مفتاح App Store Connect API.
+      # فنحن نُجهّز شهادة يدوية **فقط** إن أضفتها أنت (مسار احتياطي إن فشل السحابي).
+      - name: تجهيز شهادة التوزيع في keychain مؤقت (اختياري)
+        if: env.CERT_P12_BASE64 != ''
+        env:
+          CERT_P12_BASE64: ${{ secrets.DIST_CERT_P12_BASE64 }}
+          CERT_PASSWORD: ${{ secrets.DIST_CERT_PASSWORD }}
+        run: |
+          KEYCHAIN=build.keychain
+          KEYCHAIN_PASS=ci-temporary-password
+          security create-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN"
+          security set-keychain-settings -lut 3600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN"
+          echo "$CERT_P12_BASE64" | base64 --decode > cert.p12
+          security import cert.p12 -k "$KEYCHAIN" -P "$CERT_PASSWORD" \
+            -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASS" "$KEYCHAIN" > /dev/null
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+          security default-keychain -s "$KEYCHAIN"
+          rm -f cert.p12
+
+      # ───────── البناء ─────────
+
+      - name: أرشفة التطبيق
+        run: |
+          xcodebuild archive \
+            -project "$PROJECT" \
+            -scheme "$SCHEME" \
+            -configuration Release \
+            -destination "$BUILD_DESTINATION" \
+            -archivePath build/Tasbih.xcarchive \
+            CURRENT_PROJECT_VERSION=${{ github.run_number }} \
+            DEVELOPMENT_TEAM="$TEAM_ID" \
+            CODE_SIGN_STYLE=Automatic \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$PWD/private_keys/AuthKey_${ASC_KEY_ID}.p8" \
+            -authenticationKeyID "$ASC_KEY_ID" \
+            -authenticationKeyIssuerID "$ASC_ISSUER_ID"
+
+      - name: تصدير حزمة IPA موقّعة
+        run: |
+          # ⚠️ لاحظ: تطبيق ساعة **مستقل** لا يقبل `app-store-connect` في التصدير
+          #    (xcodebuild يرفضه ويقبل فقط: watchos-ad-hoc · watchos-enterprise ·
+          #     watchos-development-signed). لذلك:
+          #      • مع حاوية iOS  ⇒ نستخدم app-store-connect (وهو المسار المعتمد للنشر)
+          #      • بلا حاوية    ⇒ نستخدم watchos-development-signed (تثبيت مباشر)
+          #    عدّل EXPORT_METHOD أعلاه عند تغيير المسار.
+          cat > ExportOptions.plist <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+          <key>method</key>
+          <string>${EXPORT_METHOD}</string>
+          <key>signingStyle</key>
+          <string>automatic</string>
+          <key>teamID</key>
+          <string>${TEAM_ID}</string>
+          <key>uploadSymbols</key>
+          <true/>
+          <key>stripSwiftSymbols</key>
+          <true/>
+          </dict>
+          </plist>
+          EOF
+
+          xcodebuild -exportArchive \
+            -archivePath build/Tasbih.xcarchive \
+            -exportOptionsPlist ExportOptions.plist \
+            -exportPath build/export \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$PWD/private_keys/AuthKey_${ASC_KEY_ID}.p8" \
+            -authenticationKeyID "$ASC_KEY_ID" \
+            -authenticationKeyIssuerID "$ASC_ISSUER_ID"
+
+          ls -la build/export
+
+      - name: تحديد مسار الـ IPA
+        run: echo "IPA_PATH=$(ls build/export/*.ipa | head -1)" >> "$GITHUB_ENV"
+
+      - name: حفظ الـ IPA كأثر للتنزيل (اختياري)
+        uses: actions/upload-artifact@v4
+        with:
+          name: Tasbih-ipa
+          path: build/export/*.ipa
+          retention-days: 7
+
+      # ───────── الرفع إلى TestFlight ─────────
+
+      - name: تثبيت fastlane
+        run: |
+          cd ci
+          bundle install
+
+      - name: رفع النسخة إلى TestFlight
+        env:
+          ASC_KEY_PATH: ${{ github.workspace }}/private_keys/AuthKey_${{ secrets.ASC_KEY_ID }}.p8
+        run: |
+          cd ci
+          bundle exec fastlane ios upload

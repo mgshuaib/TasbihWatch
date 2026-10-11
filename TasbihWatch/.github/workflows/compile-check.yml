@@ -1,0 +1,142 @@
+name: ✅ فحص الترجمة (بلا أسرار)
+
+# ════════════════════════════════════════════════════════════════════════
+#  هذا هو سير العمل الذي تشغّله **أولًا**.
+#  لا يحتاج أي أسرار ولا شهادات ولا حساب مطوّر — غرضه الوحيد:
+#
+#      هل تُترجم الشيفرة بنجاح على watchOS؟
+#
+#  فيبني التطبيق والودجت بصيغة Debug مع تعطيل التوقيع
+#  (CODE_SIGNING_ALLOWED=NO)، ويفحص المخطّطين:
+#     • project.yml           (تطبيق ساعة مستقل)
+#     • project-container.yml (مع حاوية iOS لـ TestFlight)
+#
+#  ⏱️ المدة المتوقعة: 5–8 دقائق للنسخة الأولى (تنزيل XcodeGen + ترجمة).
+# ════════════════════════════════════════════════════════════════════════
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:        # ← زر «Run workflow» اليدوي
+
+concurrency:
+  group: tasbih-contract-check-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+
+  # ─────────────────────────────────────────────
+  # ① فحوصات سريعة على الملفات (بلا Mac — ثوانٍ)
+  # ─────────────────────────────────────────────
+  quick-checks:
+    name: 🔍 فحوصات الملفات
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: تثبيت PyYAML
+        run: pip install pyyaml
+
+      - name: فحص واجهات Swift وتطابق الأذكار وصلاحية App Group
+        run: python3 tests/swift-api-check.py
+
+      - name: فحص المحاكي (تفاعل + منطق)
+        working-directory: tests
+        run: |
+          npm install jsdom --silent
+          node jsdom-suite.mjs
+
+  # ─────────────────────────────────────────────
+  # ② الترجمة الفعلية على سيرفر macOS
+  # ─────────────────────────────────────────────
+  compile:
+    name: 🛠️ ${{ matrix.label }}
+    needs: quick-checks
+    runs-on: macos-15
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ① تطبيق الساعة المستقل (المسار A)
+          - key: standalone
+            spec: project.yml
+            scheme: Tasbih
+            destination: generic/platform=watchOS
+            label: ترجمة تطبيق الساعة (مستقل)
+          # ② حاوية iOS (المسار B — للنشر في TestFlight)
+          - key: container-ios
+            spec: project-container.yml
+            scheme: TasbihContainer
+            destination: generic/platform=iOS
+            label: ترجمة حاوية iOS (للنشر)
+          # ③ تطبيق الساعة داخل مشروع الحاوية (تأكيد أن المسارين سليمان)
+          - key: container-watch
+            spec: project-container.yml
+            scheme: Tasbih
+            destination: generic/platform=watchOS
+            label: ترجمة تطبيق الساعة (داخل الحاوية)
+    env:
+      SPEC: ${{ matrix.spec }}
+      SCHEME: ${{ matrix.scheme }}
+      BUILD_DESTINATION: ${{ matrix.destination }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: أحدث Xcode على السيرفر
+        run: |
+          sudo xcode-select -s "$(ls -d /Applications/Xcode*.app | sort -V | tail -1)"
+          xcodebuild -version
+
+      - name: تثبيت XcodeGen
+        run: brew install xcodegen
+
+      - name: توليد مشروع Xcode من ${{ matrix.spec }}
+        run: xcodegen generate --spec "$SPEC"
+
+      - name: قائمة المخطّطات (تشخيص)
+        run: xcodebuild -list -project Tasbih.xcodeproj
+
+      - name: 🛠️ ترجمة بلا توقيع — ${{ matrix.label }}
+        run: |
+          set -o pipefail
+          mkdir -p build
+          xcodebuild build \
+            -project Tasbih.xcodeproj \
+            -scheme "$SCHEME" \
+            -configuration Debug \
+            -destination "$BUILD_DESTINATION" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" \
+            SWIFT_TREAT_WARNINGS_AS_ERRORS=NO \
+            -resultBundlePath build/${{ matrix.spec }}.xcresult \
+            2>&1 | tee build-log-${{ matrix.key }}.txt | tail -80
+
+      - name: 📋 ملخّص النتيجة
+        if: always()
+        run: |
+          echo "════════ ${{ matrix.spec }} — ${{ matrix.label }} ════════"
+          if grep -q "BUILD SUCCEEDED" build-log-${{ matrix.key }}.txt 2>/dev/null; then
+            echo "✅ BUILD SUCCEEDED"
+          else
+            echo "❌ BUILD FAILED — الأخطاء:"
+            grep -E "error:" build-log-${{ matrix.key }}.txt | sort -u | head -40 || true
+            echo
+            echo "⚠️ تحذيرات (لا توقف البناء):"
+            grep -E "warning:" build-log-${{ matrix.key }}.txt | sort -u | head -20 || true
+          fi
+
+      - name: رفع سجل البناء (للتنزيل عند الفشل)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-${{ matrix.key }}   # ← فريد: مدخلان يشتركان في spec نفسه
+          path: build-log-${{ matrix.key }}.txt
+          retention-days: 14
